@@ -449,7 +449,8 @@ libpq_executeFileMap(filemap_t *map)
 	 * First create a temporary table, and load it with the blocks that we
 	 * need to fetch.
 	 */
-	sql = "CREATE TEMPORARY TABLE fetchchunks(path text, begin int8, len int4);";
+	//sql = "CREATE TEMPORARY TABLE fetchchunks(path text, begin int8, len int4);";
+	sql = "CREATE TABLE fetchchunks(path text, begin int8, len int4);";
 	run_simple_command(sql);
 
 	sql = "COPY fetchchunks FROM STDIN";

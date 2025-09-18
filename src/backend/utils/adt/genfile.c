@@ -30,6 +30,8 @@
 #include "miscadmin.h"
 #include "postmaster/syslogger.h"
 #include "storage/fd.h"
+#include "common/checksum_helper.h"
+#include "storage/checksum.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -206,6 +208,293 @@ read_binary_file(const char *filename, int64 seek_offset, int64 bytes_to_read,
 	return buf;
 }
 
+struct exclude_list_item
+{
+	const char *name;
+	bool		match_prefix;
+};
+
+static const struct exclude_list_item noChecksumFiles[] = {
+	{"pg_control", false},
+	{"pg_filenode.map", false},
+	{"pg_internal.init", true},
+	{"PG_VERSION", false},
+#ifdef EXEC_BACKEND
+	{"config_exec_params", true},
+#endif
+	{NULL, false}
+};
+
+static bool
+is_checksummed_file(const char *fullpath, const char *filename)
+{
+	/* Check that the file is in a tablespace */
+	if (strncmp(fullpath, "./global/", 9) == 0 ||
+		strncmp(fullpath, "./base/", 7) == 0 ||
+		strncmp(fullpath, "/", 1) == 0)
+	{
+		int			excludeIdx;
+
+		/* Compare file against noChecksumFiles skip list */
+		for (excludeIdx = 0; noChecksumFiles[excludeIdx].name != NULL; excludeIdx++)
+		{
+			int			cmplen = strlen(noChecksumFiles[excludeIdx].name);
+
+			if (!noChecksumFiles[excludeIdx].match_prefix)
+				cmplen++;
+			if (strncmp(filename, noChecksumFiles[excludeIdx].name,
+						cmplen) == 0)
+				return false;
+		}
+
+		return true;
+	}
+	else
+		return false;
+}
+
+static bytea *
+read_binary_file_checksum(const char *filename, int64 seek_offset, int64 bytes_to_read,
+				 bool missing_ok)
+{
+	bytea	   *buf;
+	size_t		nbytes = 0;
+	FILE	   *file;
+
+	missing_ok = true;
+
+	/* clamp request size to what we can actually deliver */
+	if (bytes_to_read > (int64) (MaxAllocSize - VARHDRSZ))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("requested length too large")));
+
+	if ((file = AllocateFile(filename, PG_BINARY_R)) == NULL)
+	{
+		if (missing_ok && errno == ENOENT)
+			return NULL;
+		else
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\" for reading: %m",
+							filename)));
+	}
+
+	//{
+	bool verify_checksum = false;
+	int segmentno = 0;
+	char *segmentpath;
+	{
+		char	   *fn;
+		fn = last_dir_separator(filename) + 1;
+		if (is_checksummed_file(filename, fn))
+		{
+			verify_checksum = true;
+
+			/*
+				* Cut off at the segment boundary (".") to get the segment number
+				* in order to mix it into the checksum.
+				*/
+			segmentpath = strstr(fn, ".");
+			if (segmentpath != NULL)
+			{
+				segmentno = atoi(segmentpath + 1);
+				if (segmentno == 0)
+					ereport(ERROR,
+							(errmsg("invalid segment number %d in file \"%s\"",
+									segmentno, fn)));
+			}
+		}
+	}
+	//}
+
+	if (fseeko(file, (off_t) seek_offset,
+			   (seek_offset >= 0) ? SEEK_SET : SEEK_END) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in file \"%s\": %m", filename)));
+
+	if (bytes_to_read >= 0)
+	{
+		/* If passed explicit read size just do it */
+		buf = (bytea *) palloc((Size) bytes_to_read + VARHDRSZ);
+
+		nbytes = fread(VARDATA(buf), 1, (size_t) bytes_to_read, file);
+	}
+	else
+	{
+		/* Negative read size, read rest of file */
+		StringInfoData sbuf;
+
+		initStringInfo(&sbuf);
+		/* Leave room in the buffer for the varlena length word */
+		sbuf.len += VARHDRSZ;
+		Assert(sbuf.len < sbuf.maxlen);
+
+		while (!(feof(file) || ferror(file)))
+		{
+			size_t		rbytes;
+
+			/* Minimum amount to read at a time */
+#define MIN_READ_SIZE 4096
+
+			/*
+			 * If not at end of file, and sbuf.len is equal to
+			 * MaxAllocSize - 1, then either the file is too large, or
+			 * there is nothing left to read. Attempt to read one more
+			 * byte to see if the end of file has been reached. If not,
+			 * the file is too large; we'd rather give the error message
+			 * for that ourselves.
+			 */
+			if (sbuf.len == MaxAllocSize - 1)
+			{
+				char	rbuf[1];
+
+				if (fread(rbuf, 1, 1, file) != 0 || !feof(file))
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("file length too large")));
+				else
+					break;
+			}
+
+			/* OK, ensure that we can read at least MIN_READ_SIZE */
+			enlargeStringInfo(&sbuf, MIN_READ_SIZE);
+
+			/*
+			 * stringinfo.c likes to allocate in powers of 2, so it's likely
+			 * that much more space is available than we asked for.  Use all
+			 * of it, rather than making more fread calls than necessary.
+			 */
+			rbytes = fread(sbuf.data + sbuf.len, 1,
+						   (size_t) (sbuf.maxlen - sbuf.len - 1), file);
+			sbuf.len += rbytes;
+			nbytes += rbytes;
+		}
+
+		/* Now we can commandeer the stringinfo's buffer as the result */
+		buf = (bytea *) sbuf.data;
+	}
+
+	if (ferror(file))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read file \"%s\": %m", filename)));
+	
+	//{
+	if (bytes_to_read >= 0)
+	{
+		int cnt = (int) nbytes;
+		BlockNumber blkno = 0;
+		uint16 checksum;
+		PageHeader phdr;
+		bool block_retry = false;
+		int checksum_failures = 0;
+		pg_checksum_context checksum_ctx;
+
+		pg_checksum_init(&checksum_ctx, CHECKSUM_TYPE_CRC32C);
+	
+		if (cnt == 0 || (verify_checksum && (cnt % BLCKSZ != 0)))
+		{
+			//ereport(WARNING, (errmsg("could not verify checksum in file \"%s\"", filename)));
+			verify_checksum = false;
+		}
+		if (verify_checksum)
+		{
+			char *page;
+			for (int i = 0; i < cnt / BLCKSZ; i++)
+			{
+				page = (char *)buf + BLCKSZ * i;
+
+				/*
+				 * Only check pages which have not been modified since the
+				 * start of the base backup. Otherwise, they might have been
+				 * written only halfway and the checksum would not be valid.
+				 * However, replaying WAL would reinstate the correct page in
+				 * this case. We also skip completely new pages, since they
+				 * don't have a checksum yet.
+				 */
+				if (!PageIsNew(page))
+				{
+					checksum = pg_checksum_page((char *) page, blkno + segmentno * RELSEG_SIZE);
+					phdr = (PageHeader) page;
+					if (phdr->pd_checksum != checksum)
+					{
+						/*
+						 * Retry the block on the first failure.  It's
+						 * possible that we read the first 4K page of the
+						 * block just before postgres updated the entire block
+						 * so it ends up looking torn to us.  We only need to
+						 * retry once because the LSN should be updated to
+						 * something we can ignore on the next pass.  If the
+						 * error happens again then it is a true validation
+						 * failure.
+						 */
+						if (block_retry == false)
+						{
+							int			reread_cnt;
+
+							if (fseeko(file, (off_t) seek_offset,
+								(seek_offset >= 0) ? SEEK_SET : SEEK_END) != 0)
+								ereport(ERROR,
+										(errcode_for_file_access(),
+										errmsg("could not seek in file \"%s\": %m", filename)));
+
+							reread_cnt = fread(VARDATA(buf), 1, (size_t) bytes_to_read, file);
+							if (reread_cnt == 0)
+							{
+								/*
+								 * If we hit end-of-file, a concurrent
+								 * truncation must have occurred, so break out
+								 * of this loop just as if the initial fread()
+								 * returned 0. We'll drop through to the same
+								 * code that handles that case. (We must fix
+								 * up cnt first, though.)
+								 */
+								cnt = BLCKSZ * i;
+								break;
+							}
+
+							/* Set flag so we know a retry was attempted */
+							block_retry = true;
+
+							/* Reset loop to validate the block again */
+							i--;
+							continue;
+						}
+
+						checksum_failures++;
+
+						if (checksum_failures <= 5)
+							ereport(WARNING,
+									(errmsg("checksum verification failed in "
+											"file \"%s\", block %d: calculated "
+											"%X but expected %X",
+											filename, blkno, checksum,
+											phdr->pd_checksum)));
+						if (checksum_failures == 5)
+							ereport(WARNING,
+									(errmsg("further checksum verification "
+											"failures in file \"%s\" will not "
+											"be reported", filename)));
+					}
+				}
+				block_retry = false;
+				blkno++;
+			}
+		}
+		/* Also feed it to the checksum machinery. */
+		pg_checksum_update(&checksum_ctx, (uint8 *) buf, cnt);
+	}
+	//}
+
+	SET_VARSIZE(buf, nbytes + VARHDRSZ);
+
+	FreeFile(file);
+
+	return buf;
+}
+
 /*
  * Similar to read_binary_file, but we verify that the contents are valid
  * in the database encoding.
@@ -344,8 +633,12 @@ pg_read_binary_file(PG_FUNCTION_ARGS)
 
 	filename = convert_and_check_filename(filename_t);
 
-	result = read_binary_file(filename, seek_offset,
-							  bytes_to_read, missing_ok);
+	if (missing_ok)
+		result = read_binary_file(filename, seek_offset,
+								bytes_to_read, missing_ok);
+	else
+		result = read_binary_file_checksum(filename, seek_offset,
+								bytes_to_read, missing_ok);
 	if (result)
 		PG_RETURN_BYTEA_P(result);
 	else
