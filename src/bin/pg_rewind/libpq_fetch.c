@@ -450,10 +450,10 @@ libpq_executeFileMap(filemap_t *map)
 	 * need to fetch.
 	 */
 	//sql = "CREATE TEMPORARY TABLE fetchchunks(path text, begin int8, len int4);";
-	sql = "CREATE TABLE fetchchunks(path text, begin int8, len int4);";
+	sql = "CREATE TABLE public.fetchchunks(path text, begin int8, len int4);";
 	run_simple_command(sql);
 
-	sql = "COPY fetchchunks FROM STDIN";
+	sql = "COPY public.fetchchunks FROM STDIN";
 	res = PQexec(conn, sql);
 
 	if (PQresultStatus(res) != PGRES_COPY_IN)
@@ -521,7 +521,7 @@ libpq_executeFileMap(filemap_t *map)
 	sql =
 		"SELECT path, begin,\n"
 		"  pg_read_binary_file(path, begin, len, true) AS chunk\n"
-		"FROM fetchchunks\n";
+		"FROM public.fetchchunks\n";
 
 	receiveFileChunks(sql);
 }
